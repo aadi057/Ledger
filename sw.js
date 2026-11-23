@@ -1,5 +1,5 @@
 // Bump CACHE_NAME on every content change so phones fetch the new build.
-const CACHE_NAME = 'aadi-ledger-v18';
+const CACHE_NAME = 'aadi-ledger-v19';
 const ASSETS = [
   './',
   './index.html',

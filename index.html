@@ -471,7 +471,7 @@
   <div class="panel-body">
     <div class="field"><label for="cardKey">Access key</label><input type="password" id="cardKey" placeholder="Paste your access key" autocomplete="off"></div>
     <p class="note">The same key goes in the iPhone Shortcut and the Gmail script. It's stored only on this device.</p>
-    <p class="note"><b>Statement day</b> is when the bill is made (18 for "18th to 18th"); leave it empty for the calendar month. <b>EMIs from</b> links the card to a payment source, so its EMIs count in "with card EMIs". <b>Credit limit</b> is on your statement or in the bank's app.</p>
+    <p class="note"><b>Statement day</b> is when the bill is made (18 for "18th to 18th"); leave it empty for the calendar month. <b>EMIs from</b> links the card to a payment source, so its EMIs count in "with card EMIs". <b>Credit limit</b> is on your statement or in the bank's app. <b>Bill due</b> is how many days after the statement the bill must be paid; 20 if left empty.</p>
     <div id="cardsList"></div>
     <button class="btn" id="addCardBtn" style="margin-top:14px">+ Add a card</button>
     <button class="btn primary" id="cardsSave" style="margin-top:8px">Save</button>
@@ -767,6 +767,12 @@ function inrOf(t){
 }
 const signed = t => (t.kind === 'refund' ? -1 : 1) * inrOf(t).v;
 const counts = t => !t.status;
+// bill payments and statements arrive with the alerts but are never spends
+const isSpendTxn = t => !t.kind || t.kind === 'spend' || t.kind === 'refund';
+// "20" (some banks give two digits) is the same card as "5320"
+const sameCard = (a, b) => !!a && !!b && (a === b || (a.length < b.length ? b.endsWith(a) : a.endsWith(b)));
+const addDays = (d, n) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + n);
+const DUE_DAYS = 20;   // bill due this many days after the statement, unless the card says otherwise
 
 function cycleFor(stmt, ref){
   ref = ref || today();
@@ -781,12 +787,13 @@ function cycleFor(stmt, ref){
 
 function cardModel(){
   const known = new Set(cards.map(c=>c.last4));
-  const extra = [...new Set(cardTxns.txns.map(t=>t.last4).filter(l=>!known.has(l)))]
+  const extra = [...new Set(cardTxns.txns.filter(isSpendTxn).map(t=>t.last4).filter(l=>!known.has(l)))]
     .map(l=>({last4:l, name:'Card', stmt:null, source:'', unknown:true}));
   const rows = [...cards, ...extra].map((c,i)=>{
     const cyc = cycleFor(c.stmt ? Number(c.stmt) : null);
     const s = ymd(cyc.start), e = ymd(cyc.end);
-    const txns = cardTxns.txns.filter(t=>t.last4===c.last4 && t.date>=s && t.date<=e);
+    const txns = cardTxns.txns.filter(t=>isSpendTxn(t) && t.last4===c.last4 && t.date>=s && t.date<=e);
+    const bill = billFor(c, cyc);
     const spent = txns.filter(counts).reduce((a,t)=>a+signed(t),0);
     const emis = c.source ? entries.filter(x=>isActive(x) && DEBT_CATS.includes(x.cat) && x.source===c.source) : [];
     const emi = emis.reduce((a,x)=>a+Number(x.amount||0),0);
@@ -797,13 +804,36 @@ function cardModel(){
     const limit = Number(c.limit) || li.total || 0;
     const util = limit ? (Math.max(0,spent) + emi) / limit : null;                         // this bill vs limit
     const inUse = limit && li.avl ? Math.max(0, Math.min(1, (limit - li.avl.v) / limit)) : null;  // per the bank, incl. EMI principal
-    return {c, cyc, txns, spent, emi, emis, daysLeft, progress, limit, util, inUse, avl:li.avl, color:CARD_COLORS[i % CARD_COLORS.length], est: txns.some(t=>counts(t) && inrOf(t).est)};
+    return {c, cyc, txns, spent, emi, emis, daysLeft, progress, limit, util, inUse, avl:li.avl, color:CARD_COLORS[i % CARD_COLORS.length], est: txns.some(t=>counts(t) && inrOf(t).est),
+      bill, owed: bill.left + Math.max(0, spent) + emi};
   });
   const spent = rows.reduce((a,r)=>a+r.spent,0), emi = rows.reduce((a,r)=>a+r.emi,0);
   const withLimit = rows.filter(r=>r.limit);
   const limitSum = withLimit.reduce((a,r)=>a+r.limit,0);
   const util = limitSum ? withLimit.reduce((a,r)=>a+Math.max(0,r.spent)+r.emi,0) / limitSum : null;
-  return {rows, spent, emi, all: spent+emi, est: rows.some(r=>r.est), util, limitSum, limitCards: withLimit.length};
+  const billed = rows.reduce((a,r)=>a+r.bill.left,0);
+  return {rows, spent, emi, all: spent+emi, est: rows.some(r=>r.est), util, limitSum, limitCards: withLimit.length,
+    billed, dues: billed + Math.max(0, spent) + emi, bills: rows.filter(r=>r.bill.amount > 0)};
+}
+
+/* The statement that closed before the current cycle: what it came to, when it's due, what's been paid.
+   It stays owed until payments cover it or it's marked paid, so closing a statement never makes the total drop. */
+function billFor(c, cyc){
+  const end = addDays(cyc.start, -1);                       // last statement date
+  const prev = cycleFor(c.stmt ? Number(c.stmt) : null, end);
+  const s = ymd(prev.start), e = ymd(prev.end);
+  const mine = cardTxns.txns.filter(t=>sameCard(t.last4, c.last4));
+  const spends = mine.filter(t=>isSpendTxn(t) && t.date>=s && t.date<=e && counts(t)).reduce((a,t)=>a+signed(t),0);
+  const emi = c.source ? entries.filter(x=>isActive(x) && DEBT_CATS.includes(x.cat) && x.source===c.source).reduce((a,x)=>a+Number(x.amount||0),0) : 0;
+  // the bank's own statement, if one arrived for this cycle
+  const stmt = mine.filter(t=>t.kind==='statement' && (t.statementDate||t.date) >= e && (t.statementDate||t.date) <= ymd(addDays(end, 12))).sort(byNewest)[0];
+  const amount = stmt ? Number(stmt.amount) : Math.max(0, spends + emi);
+  const due = stmt && stmt.dueDate ? parseDate(stmt.dueDate) : addDays(end, Number(c.due) || DUE_DAYS);
+  const paid = mine.filter(t=>t.kind==='payment' && t.date > e).reduce((a,t)=>a+inrOf(t).v,0);
+  const marked = c.paidFor === e;
+  const left = marked ? 0 : Math.max(0, Math.round((amount - paid) * 100) / 100);
+  const status = amount <= 0 ? 'none' : left <= 1 ? 'paid' : today() > due ? 'overdue' : 'due';
+  return {end, cycleEnd:e, amount, due, paid, left: status==='paid' ? 0 : left, status, fromBank: !!stmt, marked};
 }
 
 function agoText(iso){
@@ -846,13 +876,14 @@ function renderHome(){
   const act = entries.filter(isActive), fixed = act.reduce((s,e)=>s+Number(e.amount||0),0);
   if(connected){
     $('homeHead').innerHTML =
-      '<div class="eyebrow">Spent on cards this cycle</div>'+
-      '<div class="big">'+money(M.spent,{dec:true, approx:M.est})+'</div>'+
-      '<div class="sub"><b>'+money(M.all)+'</b> with card EMIs · '+(cardErr ? '<span class="neg">'+esc(cardErr)+'</span>' : agoText(cardTxns.at))+'</div>';
-    const rows = [...M.rows].sort((a,b)=>b.spent-a.spent);
+      '<div class="eyebrow">Card dues</div>'+
+      '<div class="big">'+money(M.dues,{dec:true, approx:M.est})+'</div>'+
+      '<div class="sub"><b>'+money(M.billed)+'</b> billed · <b>'+money(M.all)+'</b> this cycle, EMIs incl. · '+(cardErr ? '<span class="neg">'+esc(cardErr)+'</span>' : agoText(cardTxns.at))+'</div>';
+    const rows = [...M.rows].sort((a,b)=>b.owed-a.owed);
     $('homeChips').innerHTML = rows.map(r=>
       '<button class="chip" data-card="'+esc(r.c.last4)+'"><div class="chip-top"><span class="bank">'+esc(bankCode(r.c.name))+'</span><span>'+esc(r.c.name)+'<small>··'+esc(r.c.last4)+'</small></span></div>'+
-      '<div><div class="chip-amt">'+money(r.spent,{approx:r.est})+'</div><div class="chip-meta">'+(r.util!==null?'<span style="color:'+utilColor(r.util)+'">'+pct(r.util)+' used</span> · ':'')+(r.daysLeft===0?'statement today':r.daysLeft+'d left')+'</div></div></button>').join('')+
+      '<div><div class="chip-amt">'+money(r.owed,{approx:r.est})+'</div><div class="chip-meta">'+(r.bill.left>0 ? billMeta(r.bill) :
+        (r.util!==null?'<span style="color:'+utilColor(r.util)+'">'+pct(r.util)+' used</span> · ':'')+(r.daysLeft===0?'statement today':r.daysLeft+'d left'))+'</div></div></button>').join('')+
       '<button class="chip add" data-open="cardsBackdrop">'+icon('plus','width:16px;height:16px')+'Add card</button>';
     document.querySelector('#s-home .more').style.display='';
   } else {
@@ -893,7 +924,7 @@ function renderHome(){
   // recent card spends
   if(connected){
     const names = Object.fromEntries(M.rows.map(r=>[r.c.last4, r.c.name]));
-    const recent = [...cardTxns.txns].sort(byNewest).slice(0,5);
+    const recent = cardTxns.txns.filter(isSpendTxn).sort(byNewest).slice(0,5);
     h += '<section class="sec"><div class="sec-h"><h3>Recent card spends</h3><button class="link" data-tab="cards">View all</button></div><div class="inner" style="padding:4px 12px">'+
       (recent.length ? recent.map(x=>txnRow(x, names[x.last4]||'Card')).join('') : '<div class="empty">New card alerts appear here as they arrive.</div>')+'</div></section>';
   }
@@ -917,6 +948,41 @@ function insight(M){
   if(soon) out.push({id:'end-'+soon.name+'-'+soon.end, html:'<b>'+esc(soon.name)+'</b> finishes in '+soon.days+' days, freeing <b>'+money(soon.freed)+'</b> a month.'});
   return out[0] || null;
 }
+
+function dueText(b){
+  const days = Math.round((b.due - today())/86400000);
+  return b.status==='overdue' ? '<span class="neg">Due date '+shortDate(b.due)+' passed</span>' : 'Due '+(days===0?'today':days===1?'tomorrow':shortDate(b.due)+' · in '+days+' days');
+}
+function billMeta(b){
+  const days = Math.round((b.due - today())/86400000);
+  return b.status==='overdue' ? '<span class="neg">Bill '+money(b.left)+' · due date passed</span>'
+    : 'Bill '+money(b.left)+' · due '+(days===0?'today':days===1?'tomorrow':shortDate(b.due));
+}
+function billsSection(M){
+  if(!M.bills.length) return '';
+  const rows = [...M.bills].sort((a,b)=>(a.bill.status==='paid')-(b.bill.status==='paid') || a.bill.due-b.bill.due);
+  return '<section class="sec" style="margin-top:10px"><div class="sec-h"><h3>Bills</h3><span class="tag g">'+money(M.billed)+' to pay</span></div><div class="inner" style="padding:4px 12px">'+
+    rows.map(r=>{
+      const b = r.bill, paid = b.status==='paid';
+      const detail = 'Statement '+shortDate(b.end)+(b.fromBank?'':' · estimated')+(b.paid>0 && !paid ? ' · '+money(b.paid)+' paid' : '');
+      const right = paid ? '<span class="tag">Paid</span>'+(b.marked?'<button class="link" data-unpaid="'+esc(r.c.last4)+'" style="font-size:12px">Undo</button>':'')
+        : '<button class="btn" data-paid="'+esc(r.c.last4)+'" style="padding:7px 12px;font-size:13px;width:auto;white-space:nowrap">Mark paid</button>';
+      return '<div class="row'+(paid?' off':'')+'"><span class="bank" style="width:34px;height:34px;font-size:10.5px">'+esc(bankCode(r.c.name))+'</span>'+
+        '<div class="mid"><div class="nm">'+esc(r.c.name)+' · '+money(paid ? b.amount : b.left)+'</div><div class="mt">'+detail+'</div><div class="mt">'+(paid?(b.marked?'Marked paid':'Payment received'):dueText(b))+'</div></div>'+
+        '<div class="rt" style="display:flex;flex-direction:column;align-items:flex-end;gap:4px">'+right+'</div></div>';
+    }).join('')+'</div></section>';
+}
+function markPaid(last4, on){
+  const c = cards.find(x=>x.last4===last4); if(!c) return;
+  const row = cardModel().rows.find(r=>r.c.last4===last4); if(!row) return;
+  c.paidFor = on ? row.bill.cycleEnd : null;
+  lsSet(CK.cards, JSON.stringify(cards)); pushState();
+  toast(on ? 'Marked paid' : 'Marked unpaid'); renderAll();
+}
+document.addEventListener('click', ev=>{
+  const p = ev.target.closest('[data-paid]'); if(p){ markPaid(p.dataset.paid, true); return; }
+  const u = ev.target.closest('[data-unpaid]'); if(u){ markPaid(u.dataset.unpaid, false); }
+});
 
 function unreadableBox(){
   return '<div class="warn"><b>Couldn’t read '+cardTxns.unreadable.length+' message'+(cardTxns.unreadable.length>1?'s':'')+'.</b> They aren’t counted. Send them to Claude to teach the app this format.'+
@@ -966,6 +1032,7 @@ function renderCards(){
       '<div class="foot-note">Spends + card EMIs across '+M.limitCards+' card'+(M.limitCards>1?'s':'')+' with a known limit ('+money(M.limitSum)+'). Under 30% is best for your credit score.'+
       (missing.length ? ' <b>Add the limit for '+missing.join(', ')+'</b> in Cards &amp; cycles to include them.' : '')+'</div></div></section>';
   }
+  h += billsSection(M);
   h += '<div class="sp-actions btn-row" style="margin:10px 0 14px"><button class="btn" data-open="pasteBackdrop" style="padding:13px;font-size:14px">Paste SMS</button><button class="btn" data-open="cardsBackdrop" style="padding:13px;font-size:14px">Cards &amp; cycles</button></div>';
   if(cardTxns.unreadable && cardTxns.unreadable.length) h += unreadableBox();
 
@@ -977,6 +1044,7 @@ function renderCards(){
       '<div class="ca">'+money(r.spent,{approx:r.est})+'</div>'+
       '<div class="cm">'+(r.c.stmt ? shortDate(r.cyc.start)+' – '+shortDate(r.cyc.end) : 'Calendar month')+' · '+(r.daysLeft===0?'statement today':r.daysLeft+'d left')+'</div>'+
       (r.emi?'<div class="cm">+ '+money(r.emi)+' EMIs</div>':'')+
+      (r.bill.left>0?'<div class="cm" style="color:var(--navy);font-weight:600">'+billMeta(r.bill)+'</div>':'')+
       (r.util!==null ? utilBar(r.util)+'<div class="cm"><b style="color:'+utilColor(r.util)+'">'+pct(r.util)+'</b> of '+money(r.limit)+' limit</div>'+
          (r.inUse!==null ? '<div class="cm">Bank shows '+pct(r.inUse)+' in use · '+shortDate(parseDate(r.avl.date))+'</div>' : '')
        : '<div class="cm" style="color:var(--blue)">Add limit to see utilisation</div>')+
@@ -1387,7 +1455,7 @@ function renderCardsCfg(){
   $('cardKey').value = cardKey();
   $('cardsMsg').textContent = '';
   cardDraft = clone(cards);
-  cardTxns.txns.forEach(t=>{ if(!cardDraft.some(c=>c.last4===t.last4)) cardDraft.push({last4:t.last4, name:'', stmt:null, source:''}); });
+  cardTxns.txns.filter(isSpendTxn).forEach(t=>{ if(!cardDraft.some(c=>c.last4===t.last4)) cardDraft.push({last4:t.last4, name:'', stmt:null, source:''}); });
   drawCardsCfg();
 }
 function drawCardsCfg(){
@@ -1399,7 +1467,8 @@ function drawCardsCfg(){
       '<div class="field"><label>Last 4 digits</label><input data-f="last4" inputmode="numeric" maxlength="4" value="'+esc(c.last4||'')+'"></div>'+
       '<div class="field"><label>Statement day</label><input data-f="stmt" type="number" inputmode="numeric" min="1" max="31" value="'+(c.stmt||'')+'" placeholder="Calendar"></div>'+
       '<div class="field"><label>EMIs from</label><div class="select-wrap"><select data-f="source">'+srcOpts(c.source)+'</select></div></div>'+
-      '<div class="field" style="grid-column:1/-1"><label>Credit limit (₹)</label><input data-f="limit" type="number" inputmode="numeric" value="'+(c.limit||'')+'" placeholder="'+(limitInfo(c.last4).total ? 'From alerts: '+rawINR(limitInfo(c.last4).total) : 'e.g. 150000')+'"></div>'+
+      '<div class="field"><label>Bill due (days after)</label><input data-f="due" type="number" inputmode="numeric" min="1" max="40" value="'+(c.due||'')+'" placeholder="'+DUE_DAYS+'"></div>'+
+      '<div class="field"><label>Credit limit (₹)</label><input data-f="limit" type="number" inputmode="numeric" value="'+(c.limit||'')+'" placeholder="'+(limitInfo(c.last4).total ? 'From alerts: '+rawINR(limitInfo(c.last4).total) : 'e.g. 150000')+'"></div>'+
     '</div></div>').join('');
 }
 $('cardsList').addEventListener('input', ev=>{
@@ -1413,7 +1482,8 @@ $('cardsList').addEventListener('click', ev=>{
 $('addCardBtn').addEventListener('click', ()=>{ cardDraft.push({last4:'', name:'', stmt:null, source:''}); drawCardsCfg(); });
 $('cardsSave').addEventListener('click', ()=>{
   const msg = $('cardsMsg');
-  const clean = cardDraft.map(c=>({last4:String(c.last4||'').trim(), name:String(c.name||'').trim() || 'Card', stmt:(Number(c.stmt)>=1 && Number(c.stmt)<=31) ? Number(c.stmt) : null, source:c.source||'', limit: Number(c.limit) > 0 ? Number(c.limit) : null}));
+  const clean = cardDraft.map(c=>({last4:String(c.last4||'').trim(), name:String(c.name||'').trim() || 'Card', stmt:(Number(c.stmt)>=1 && Number(c.stmt)<=31) ? Number(c.stmt) : null, source:c.source||'', limit: Number(c.limit) > 0 ? Number(c.limit) : null,
+    due: (Number(c.due)>=1 && Number(c.due)<=40) ? Number(c.due) : null, paidFor: c.paidFor || null}));
   if(clean.some(c=>!/^\d{4}$/.test(c.last4))){ msg.className='msg err'; msg.textContent='Each card needs its last 4 digits.'; return; }
   if(new Set(clean.map(c=>c.last4)).size !== clean.length){ msg.className='msg err'; msg.textContent='Two cards have the same last 4 digits.'; return; }
   cards = clean; lsSet(CK.cards, JSON.stringify(cards)); pushState();
